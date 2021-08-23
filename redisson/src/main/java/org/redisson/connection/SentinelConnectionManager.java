@@ -15,29 +15,18 @@
  */
 package org.redisson.connection;
 
-import io.netty.resolver.AddressResolver;
-import io.netty.util.NetUtil;
-import io.netty.util.concurrent.Future;
-import io.netty.util.concurrent.FutureListener;
-import io.netty.util.concurrent.ScheduledFuture;
-import io.netty.util.internal.StringUtil;
-import org.redisson.api.NatMapper;
-import org.redisson.api.NodeType;
-import org.redisson.api.RFuture;
-import org.redisson.client.*;
-import org.redisson.client.codec.StringCodec;
-import org.redisson.client.protocol.RedisCommands;
-import org.redisson.config.*;
-import org.redisson.connection.ClientConnectionsEntry.FreezeReason;
-import org.redisson.misc.CountableListener;
-import org.redisson.misc.RPromise;
-import org.redisson.misc.RedisURI;
-import org.redisson.misc.RedissonPromise;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import java.io.IOException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
@@ -46,6 +35,36 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
+
+import org.redisson.api.NatMapper;
+import org.redisson.api.NodeType;
+import org.redisson.api.RFuture;
+import org.redisson.client.RedisAuthRequiredException;
+import org.redisson.client.RedisClient;
+import org.redisson.client.RedisClientConfig;
+import org.redisson.client.RedisConnection;
+import org.redisson.client.RedisConnectionException;
+import org.redisson.client.codec.StringCodec;
+import org.redisson.client.protocol.RedisCommands;
+import org.redisson.config.BaseMasterSlaveServersConfig;
+import org.redisson.config.Config;
+import org.redisson.config.MasterSlaveServersConfig;
+import org.redisson.config.ReadMode;
+import org.redisson.config.SentinelServersConfig;
+import org.redisson.connection.ClientConnectionsEntry.FreezeReason;
+import org.redisson.misc.CountableListener;
+import org.redisson.misc.RPromise;
+import org.redisson.misc.RedisURI;
+import org.redisson.misc.RedissonPromise;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.netty.resolver.AddressResolver;
+import io.netty.util.NetUtil;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.FutureListener;
+import io.netty.util.concurrent.ScheduledFuture;
+import io.netty.util.internal.StringUtil;
 
 /**
  * 
@@ -73,7 +92,7 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
 
     public SentinelConnectionManager(SentinelServersConfig cfg, Config config, UUID id) {
         super(config, id);
-        
+
         if (cfg.getMasterName() == null) {
             throw new IllegalArgumentException("masterName parameter is not defined!");
         }
@@ -123,7 +142,7 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
                     throw new RedisConnectionException("Master node is undefined! SENTINEL GET-MASTER-ADDR-BY-NAME command returns empty result!");
                 }
 
-                RedisURI masterHost = toURI(master.getHostString(), String.valueOf(master.getPort()));
+                RedisURI masterHost = getIpAddr(master);
                 this.config.setMasterAddress(masterHost.toString());
                 currentMaster.set(masterHost);
                 log.info("master: {} added", masterHost);
@@ -134,20 +153,24 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
                         continue;
                     }
 
-                    String ip = map.get("ip");
+                    String host = map.get("ip");
                     String port = map.get("port");
                     String flags = map.getOrDefault("flags", "");
                     String masterLinkStatus = map.getOrDefault("master-link-status", "");
 
-                    RedisURI host = toURI(ip, port);
+                    String ip = convertToIpAddress(host);
+                    if (ip.length() == 0) {
+                        continue;
+                    }
+                    RedisURI uri = toURI(ip, port);
 
-                    this.config.addSlaveAddress(host.toString());
-                    log.debug("slave {} state: {}", host, map);
-                    log.info("slave: {} added", host);
+                    this.config.addSlaveAddress(uri.toString());
+                    log.debug("slave {} state: {}", uri, map);
+                    log.info("slave: {} added", uri);
 
                     if (isSlaveDown(flags, masterLinkStatus)) {
-                        disconnectedSlaves.add(host);
-                        log.warn("slave: {} is down", host);
+                        disconnectedSlaves.add(uri);
+                        log.warn("slave: {} is down", uri);
                     }
                 }
                 
@@ -162,6 +185,7 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
                     String port = map.get("port");
 
                     RedisURI sentinelAddr = toURI(ip, port);
+                    // No need to convert to an IP address here because the registerSentinel already does it
                     RFuture<Void> future = registerSentinel(sentinelAddr, this.config, null);
                     connectionFutures.add(future);
                 }
@@ -380,7 +404,7 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
             }
 
             RedisURI current = currentMaster.get();
-            RedisURI newMaster = toURI(master.getHostString(), String.valueOf(master.getPort()));
+            RedisURI newMaster = getIpAddr(master);
             if (!newMaster.equals(current)
                     && currentMaster.compareAndSet(current, newMaster)) {
                 RFuture<RedisClient> changeFuture = changeMaster(singleSlotRange.getStartSlot(), newMaster);
@@ -408,19 +432,29 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
                         continue;
                     }
                     
-                    String ip = map.get("ip");
+                    String host = map.get("ip");
                     String port = map.get("port");
                     String flags = map.getOrDefault("flags", "");
                     String masterLinkStatus = map.getOrDefault("master-link-status", "");
                     String masterHost = map.get("master-host");
                     String masterPort = map.get("master-port");
 
+                    final String ip = convertToIpAddress(host);
+                    if (host.length() == 0) {
+                        continue;
+                    }
                     RedisURI slaveAddr = toURI(ip, port);
-                    if (isSlaveDown(flags, masterLinkStatus)) {
+                    // Check whether the slave is down because a flag indicates it or because we can't connect to it
+                    if (isSlaveDown(flags, masterLinkStatus) || !isSlaveReachable(slaveAddr)) {
                         slaveDown(slaveAddr);
                         continue;
                     }
-                    if ("?".equals(masterHost) || !isUseSameMaster(slaveAddr, masterHost, masterPort)) {
+
+                    if ("?".equals(masterHost)) {
+                        continue;
+                    }
+                    final String masterIpAddress = convertToIpAddress(masterHost);
+                    if (masterIpAddress.length() == 0 || !isUseSameMaster(slaveAddr, masterIpAddress, masterPort)) {
                         continue;
                     }
 
@@ -435,7 +469,7 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
                         MasterSlaveEntry entry = getEntry(singleSlotRange.getStartSlot());
                         entry.getAllEntries().stream()
                                 .map(e -> e.getClient().getAddr())
-                                .map(a -> toURI(a.getAddress().getHostAddress(), String.valueOf(a.getPort())))
+                                .map(a -> getIpAddr(a))
                                 .filter(a -> !currentSlaves.contains(a) && !a.equals(currentMaster.get()))
                                 .forEach(a -> slaveDown(a));
                     };
@@ -454,8 +488,14 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
             if (e != null || list.isEmpty()) {
                 return;
             }
-            
+
+            // Might be more efficient to not do this in a stream since we are calling convertToIpAddress twice
             Set<RedisURI> newUris = list.stream().filter(m -> {
+                String host = m.get("ip");
+                if (convertToIpAddress(host) == null) {
+                    return false;
+                }
+
                 String flags = m.getOrDefault("flags", "");
                 String masterLinkStatus = m.getOrDefault("master-link-status", "");
                 if (!m.isEmpty() && !isSlaveDown(flags, masterLinkStatus)) {
@@ -463,8 +503,11 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
                 }
                 return false;
             }).map(m -> {
-                String ip = m.get("ip");
+                String host = m.get("ip");
                 String port = m.get("port");
+                // This is needed since updateSentinels checks the maps and the sentinels map currently
+                // contain IP addresses (due to registerSentinel converting them to IP addresses)
+                String ip = convertToIpAddress(host);
                 return toURI(ip, port);
             }).collect(Collectors.toSet());
             
@@ -475,6 +518,22 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
             updateSentinels(newUris);
         });
         sentinelsFuture.onComplete(commonListener);
+    }
+
+    private boolean isSlaveReachable(RedisURI slaveAddr) {
+        try {
+            return InetAddress.getByName(slaveAddr.getHost()).isReachable(3000);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private String convertToIpAddress(String host) {
+        try {
+            return InetAddress.getByName(host).getHostAddress();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private void updateSentinels(Set<RedisURI> newUris) {
@@ -504,6 +563,7 @@ public class SentinelConnectionManager extends MasterSlaveConnectionManager {
         return disconnectedSlaves;
     }
 
+    // This function will take a hostname and convert it to an IP address before adding it to the sentinels map
     private RFuture<Void> registerSentinel(RedisURI addr, MasterSlaveServersConfig c, String sslHostname) {
         boolean isHostname = NetUtil.createByteArrayFromIpAddressString(addr.getHost()) == null;
         if (!isHostname) {
